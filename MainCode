@@ -1,0 +1,407 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+This is reproducible code for "A new Bivariate Cure Rate Model and its application to Diabetic Retinopathy"
+
+To load required libraries. The MDBED package is no longer available to download from cran, so users must download the latest archive version (https://CRAN.R-project.org/package=MDBED) and then use the source function
+```{r library}
+library(fitdistrplus)
+library(survival)
+source( "/MDBED/R/rBED.R")
+```
+
+Set parameter values for the simulation study
+```{r}
+n=100
+rho=0.7
+a1=1
+a2=1.5
+b1=1.5
+b2=2
+simnum=500
+it=30
+phi00=0.24
+phi01=0.22
+phi10=0.28
+crate=0.1
+date= 1015  ##For naming file
+set.seed(date)
+lgo<-orthopolynom::glaguerre.polynomials(n=49, alpha=1, normalized=FALSE)
+lg<-lapply(lgo, as.function)
+lg2o<-orthopolynom::glaguerre.polynomials(n=49, alpha=2, normalized=FALSE)
+lg2<-lapply(lg2o, as.function)
+```
+
+Function to generate a dataset with the desired bivariate cure rate properties.
+```{r }
+newdatagen1<-function(a1,a2,b1,b2,n, rho, phi00, phi01, phi10, crate, ftime){
+  xobs<-c()
+  yobs<-c()
+  cenx<-c()
+  ceny<-c()
+  expdata<-rBED(rho=rho, 1,1,n)
+  u<-runif(n)
+  ctime<-rexp(n, crate)
+  centime<-pmin(ctime, ftime) ##Patients are automatically censored after ftime
+  idx1<-which(u<phi00) ## cured of both
+  idx2<-which(phi00<u & u< (phi00+phi01)) ## Cure of x, sus to y
+  idx3<-which(phi00+phi01<u & u<phi00+phi01+phi10) ## Cure of y, sus to x
+  idx4<-which(phi00+phi10+phi01<u) ##Sus to both
+  
+  cenx[idx1]<-1
+  ceny[idx1]<-1
+  xobs[idx1]<-yobs[idx1]<-centime[idx1]  ## cured of both= both cen
+
+  yobs[idx2]<-a2*expdata[idx2,2]^(1/b2)
+  ceny[idx2]<-as.integer(centime[idx2]< yobs[idx2])
+  yobs[idx2]<-ifelse(ceny[idx2]==1, centime[idx2], yobs[idx2])
+  xobs[idx2]<-centime[idx2] ## Cure of x = cen
+  cenx[idx2]<-1
+  
+  xobs[idx3]<-a1*expdata[idx3,1]^(1/b1)
+  cenx[idx3]<-as.integer(centime[idx3]< xobs[idx3])
+  xobs[idx3]<-ifelse(cenx[idx3]==1, centime[idx3], xobs[idx3])
+  yobs[idx3]<-centime[idx3] ## Cure of y = cen
+  ceny[idx3]<-1
+  
+  xobs[idx4]<-a1*expdata[idx4,1]^(1/b1)
+  yobs[idx4]<-a2*expdata[idx4,2]^(1/b2)
+  ceny[idx4]<-as.integer(centime[idx4]< yobs[idx4])
+  yobs[idx4]<-ifelse(ceny[idx4]==1, centime[idx4], yobs[idx4])
+  cenx[idx4]<-as.integer(centime[idx4]< xobs[idx4])
+  xobs[idx4]<-ifelse(cenx[idx4]==1, centime[idx4], xobs[idx4])
+  return(data.frame(xobs,yobs, cenx, ceny)) ##cenx=1 if censored, 0 if observed
+}
+```
+
+
+Functions required to fit the model
+```{r functions required to run the EM alogirhtm}
+##This is the function for the pdf 
+omdbwpdf<-function(x,y,a1,a2,b1,b2, rho){
+  x1<-(x/a1)^b1
+  y1<-(y/a2)^b2
+  ans<-b1*b2*x1*y1/((1-rho)*x*y)*exp(-(x1+y1)/(1-rho))*besselI(2*sqrt(rho*x1*y1)/(1-rho),0)
+  return(ans)
+}
+
+omdbwsurv<-function(x,y,a1,a2,b1,b2, rho, lg, lg2){
+  n<-50 
+  x1<-(x/a1)^b1
+  y1<-(y/a2)^b2
+  k<-0:(n-1)
+  coeff<-((rho)^(k+1))/ (k+1)^2
+  coeffmat<-matrix(data=rep(coeff, length(x1)),nrow= length(x1), byrow=TRUE)
+  term_x <- sapply(lg, function(f) f(x1))
+  term_y <- sapply(lg, function(f) f(y1))
+  Term <- coeffmat * term_x * term_y
+  ans<-exp(-x1-y1)+x1*y1*exp(-x1-y1)*rowSums(Term)
+  ans[!is.finite(ans) | ans < 0]<-1e-100
+  return(ans)
+}
+
+omdbwsdashx<-function(x,y,a1,a2,b1,b2, rho, lg, lg2){
+  n<-50 
+  x1<-(x/a1)^b1
+  y1<-(y/a2)^b2
+  k<-0:(n-1)
+  coeff<-((rho)^(k+1))/ (k+1)^2
+  coeffmat<-matrix(data=rep(coeff, length(x1)),nrow= length(x1), byrow=TRUE)
+  lst1 <- sapply(lg, function(f) f(y1))
+  lst2 <- sapply(lg, function(f) f(x1))
+  lst3 <- sapply(lg2, function(f) f(x1))
+  ifelse(is.na(dim(lst3)), lst3 <- cbind(0,length(x1), lst3[1:(n-1)]), lst3 <- cbind(rep(0,length(x1)), lst3[,1:(n-1)]))
+  Term <- lst1 * lst2 *coeffmat
+  Term2 <- lst3*lst1*coeffmat
+  ans<- -b1/x*x1*exp(-x1-y1)+(b1/x-b1*x1/x)*x1*y1*exp(-x1-y1)*rowSums(Term)- b1/x*x1*x1*y1*exp(-x1-y1)*rowSums(Term2)
+  ans[!is.finite(ans) | ans >= 0]<--1e-100
+  return(ans)
+}
+
+##EM algorithm
+##E step
+opifun<-function(x,y,a1,a2,b1,b2,rho, phi00, phi01, phi10,  idx00,idx01, idx10,idx11, lg, lg2){ 
+  phi11<-1-phi00-phi10-phi01
+  probs=matrix(data=NA, nrow=length(x), ncol=4)
+  dx<-dweibull(x,b1,a1)
+  dy<-dweibull(y,b2,a2)
+  sx<-1-pweibull(x,b1,a1)
+  sy<-1-pweibull(y,b2,a2)
+  probs[idx00,4]<-1 ##both observed so both sus
+  probs[idx00,1:3]<-0 
+  
+  if (length(idx01) > 0) { #x obs, y cen
+    px<- dx[idx01]
+    xvals<- x[idx01]
+    yvals<- y[idx01]
+    s1 <- vapply(seq_along(xvals), function(i) {
+      omdbwsdashx(xvals[i], yvals[i], a1, a2, b1, b2, rho, lg, lg2)
+    }, numeric(1))
+    denom<-phi10*px-phi11*s1
+    p3<-phi10*px/denom
+    probs[idx01, 3]<-p3
+    probs[idx01, 4]<-1-p3
+    probs[idx01, 1:2]<-0
+  }
+  
+  if (length(idx10) > 0) {#x cen, y obs
+    py <- dy[idx10]
+    xvals <- x[idx10]
+    yvals <- y[idx10]
+    s2 <- vapply(seq_along(yvals), function(i) {
+      omdbwsdashx(yvals[i], xvals[i], a2, a1, b2, b1, rho, lg, lg2)
+    }, numeric(1))
+    denom<-phi01*py-phi11*s2
+    p2<-phi01*py/denom
+    probs[idx10, 2]<-p2
+    probs[idx10, 4]<-1-p2
+    probs[idx10, 1]<-0
+    probs[idx10, 3]<-0
+  }
+  
+  if (length(idx11) > 0) { ##both censored
+    xvals <- x[idx11]
+    yvals <- y[idx11]
+    sxv <- sx[idx11]
+    syv <- sy[idx11]
+    survs <- vapply(seq_along(xvals), function(i) {
+      omdbwsurv(xvals[i], yvals[i], a1, a2, b1, b2, rho, lg, lg2)
+    }, numeric(1))
+    denom <- phi11 * survs + phi10 * sxv + phi01 * syv + phi00
+    probs[idx11, 1]<-phi00/denom
+    probs[idx11, 2]<-phi01*syv / denom
+    probs[idx11, 3]<-phi10*sxv / denom
+    probs[idx11, 4]<-1-rowSums(probs[idx11, 1:3])
+  }
+  return(probs)
+}
+
+##This is the q function 
+olikelihoodfun<-function(x,y,a1,a2,b1,b2,rho,phi00,phi01,phi10, pi1, pi2, pi3, pi4, idx00,idx01, idx10,idx11, lg, lg2){ 
+  phi11<-1-phi00-phi10-phi01
+  ans<-c()
+  ans[idx00]<-pi4[idx00]*log(phi11*omdbwpdf(x[idx00],y[idx00],a1,a2,b1,b2, rho)) ##both observed, both susceptible
+  tryCatch({ans[idx01]<-pi4[idx01]*log(-phi11*omdbwsdashx(x[idx01],y[idx01],a1,a2,b1,b2, rho, lg, lg2))+pi3[idx01]*log(phi10*dweibull(x[idx01],b1,a1))},
+           warning=function(w) print(c(a1,a2,b1,b2,rho, phi10, phi01, phi00, phi11)))
+  ans[idx10]<-pi4[idx10]*log(-phi11*omdbwsdashx(y[idx10],x[idx10],a1,a2,b1,b2, rho, lg, lg2))+pi2[idx10]*log(phi01*dweibull(y[idx10],b2,a2)) ##cen x, obs y
+  ans[idx11]<-pi4[idx11]*log(phi11*omdbwsurv(x[idx11],y[idx11],a1,a2,b1,b2, rho, lg, lg2))+pi3[idx11]*log(phi10*(1-pweibull(x[idx11],b1,a1)))+pi2[idx11]*log(phi01*(1-pweibull(y[idx11],b2,a2)))+pi1[idx11]*log(phi00)
+  ans[!is.finite(ans)]<--1000
+  if(sum(ans)>0){print('help olike')}
+  return(sum(ans))
+}
+
+##Observed likelihood:
+compobslikefun<-function(x,y,a1,a2,b1,b2,rho,phi00,phi01,phi10, idx00,idx01, idx10,idx11,lg, lg2){
+  phi11<-1-phi00-phi10-phi01
+  lst<-c()
+  lst[idx00]<-log(phi11*omdbwpdf(x[idx00],y[idx00],a1,a2,b1,b2, rho)) ##Both observed
+  lst[idx01]<-log(-phi11*omdbwsdashx(x[idx01],y[idx01],a1,a2,b1,b2, rho, lg, lg2)+phi10*dweibull(x[idx01],b1,a1)) ##observed x, cen y
+  lst[idx10]<-log(-phi11*omdbwsdashx(y[idx10],x[idx10],a1,a2,b1,b2, rho, lg, lg2)+phi01*dweibull(y[idx10],b1,a1))  ##observed y, cen x
+  lst[idx11]<-log(phi11*omdbwsurv(x[idx11],y[idx11],a1,a2,b1,b2, rho, lg, lg2)+phi10*(1-pweibull(x[idx11],b1,a1))+phi01*(1-pweibull(y[idx11],b2,a2))+phi00)
+  lst[!is.finite(lst)] <- -1000
+  return(sum(lst))
+}
+
+onegloglikefun2<-function(paraest, piest, dataset, lg, lg2){ 
+  a1<-paraest[1]
+  a2<-paraest[2]
+  b1<-paraest[3]
+  b2<-paraest[4]
+  rho<-paraest[5]
+  phi00<-exp(paraest[6])/(1+exp(paraest[6]))
+  phi01<-1-phi00-exp(paraest[7])*(1-phi00)/(1+exp(paraest[7]))
+  phi10<-1-phi00-phi01-exp(paraest[8])*(1-phi00-phi01)/(1+exp(paraest[8]))
+  if(phi00<0){phi00<-0}
+  if(phi10<0){phi10<-0}
+  if(phi01<0){phi01<-0}
+  x<-dataset[,1]
+  y<-dataset[,2]
+  c1<-dataset[,3]
+  c2<-dataset[,4]
+  pi1<-piest[,1]
+  pi2<-piest[,2]
+  pi3<-piest[,3]
+  pi4<-piest[,4]
+  idx00<-which(c1==0 & c2 == 0)
+  idx01<-which(c1==0 & c2 == 1)
+  idx10<-which(c1==1 & c2 == 0)
+  idx11<-which(c1==1 & c2 == 1)
+  ans<-olikelihoodfun(x,y,a1,a2,b1,b2,rho,phi00,phi01,phi10, pi1, pi2, pi3, pi4, idx00,idx01, idx10,idx11, lg, lg2)
+  return(-ans)
+}
+
+##This finds starting parameters for alpha, beta and rho
+startingparafun<-function(dataset){
+  xnocen<-dataset[which(dataset$cenx==0), 1]
+  ynocen<-dataset[which(dataset$ceny==0), 2]
+  bothnocen<-dataset[which(dataset$cenx==0 & dataset$ceny==0), 1:2]
+  wf<-fitdist(xnocen, "weibull")
+  a1<-wf$estimate[2]
+  b1<-wf$estimate[1]
+  wf<-fitdist(ynocen, "weibull")
+  a2<-wf$estimate[2]
+  b2<-wf$estimate[1]
+  ifelse(length(bothnocen[,1])<2, rho<-0.5, {bothnocen<-cbind(bothnocen$xobs^(1/b1), bothnocen$yobs^(1/b2)); rho<-cor(bothnocen[,1], bothnocen[,2])})
+  if(rho< 0){
+    rho<-0.001
+  }
+  if(rho>0.99){
+    rho<-0.99
+  }
+  return(c(a1,a2,b1,b2,rho))
+}
+
+emfun<-function(dataset, it, paraest, lg, lg2){ ##The parameters are your original parameter estimates
+  k=0
+  x<-dataset[,1]
+  y<-dataset[,2]
+  c1<-dataset[,3]
+  c2<-dataset[,4]
+  comp<-0
+  a1<-paraest[1]
+  a2<-paraest[2]
+  b1<-paraest[3]
+  b2<-paraest[4]
+  rho<-paraest[5]
+  phi00<-exp(paraest[6])/(1+exp(paraest[6]))
+  phi01<-1-phi00-exp(paraest[7])*(1-phi00)/(1+exp(paraest[7]))
+  phi10<-1-phi00-phi01-exp(paraest[8])*(1-phi00-phi01)/(1+exp(paraest[8]))
+  idx00<-which(c1==0 & c2 == 0)
+  idx10<-which(c1==1 & c2 == 0)
+  idx01<-which(c1==0 & c2 == 1)
+  idx11<-which(c1==1 & c2 == 1)
+  comp1<-compobslikefun(x,y,a1,a2,b1,b2,rho,phi00,phi01,phi10, idx00,idx01, idx10,idx11,lg, lg2)
+  while (k<it & abs(comp-comp1)> 0.00001 ){
+    k=k+1
+    piest<- opifun(x,y,a1,a2,b1,b2,rho, phi00, phi01, phi10,  idx00,idx01, idx10,idx11, lg, lg2)
+    a<-optim(paraest, fn=onegloglikefun2, piest=piest, dataset=dataset, method="L-BFGS-B", lower=c(0.01,0.01,0.01,0.01,0.1,-Inf,-Inf,-Inf), upper=c(10,10,10,10, 0.99, Inf, Inf, Inf), lg=lg, lg2=lg2)
+    paraest<-a$par
+    a1<-paraest[1]
+    a2<-paraest[2]
+    b1<-paraest[3]
+    b2<-paraest[4]
+    rho<-paraest[5]
+    phi00<-exp(paraest[6])/(1+exp(paraest[6]))
+    phi01<-1-phi00-exp(paraest[7])*(1-phi00)/(1+exp(paraest[7]))
+    phi10<-1-phi00-phi01-exp(paraest[8])*(1-phi00-phi01)/(1+exp(paraest[8]))
+    phi11<-1-phi00-phi01-phi10
+    comp<-comp1
+    comp1<-compobslikefun(x,y,a1,a2,b1,b2,rho,phi00,phi01,phi10, idx00,idx01, idx10,idx11,lg, lg2)
+  }
+  return(c(a1,a2,b1,b2,rho,phi00,phi01, phi10, phi11))
+}
+
+
+```
+
+Function to perform the simulation study
+```{r sim study}
+wrapemfun<-function(n, rho, a1, a2, b1,b2, simnum, phi00, phi01, phi10, crate, it, lg, lg2){
+  mat<-matrix(data=NA, nrow=simnum, ncol=9)
+  for (i in 1:simnum){
+    print(i)
+    dataset<-newdatagen1(a1,a2,b1,b2,n, rho, phi00, phi01, phi10, crate, ftime=5)
+    startingpara<-c(startingparafun(dataset),-1.1,0.69,0)
+    mat[i,]<-emfun(dataset, it, paraest=startingpara, lg=lg, lg2=lg2)
+    wrapmat<-data.frame(mat)
+  }
+  return(wrapmat)
+}
+
+```
+
+
+This is the real data example using the retinopathy dataset from the survival package. The model is fit and then BCA parametric bootstrap is used to find the 95% confidence intervals
+```{r dr example}
+retino<-reshape(retinopathy, idvar="id", timevar="trt",direction="wide")
+dataset<-reshape(retinopathy, idvar="id", timevar="trt",direction="wide")[,c(6,13,7,14)]
+colnames(dataset)[1]="xobs"
+colnames(dataset)[3]="cenx"
+colnames(dataset)[2]="yobs"
+colnames(dataset)[4]="ceny"
+dataset[,3]<-1-dataset[,3]
+dataset[,4]<-1-dataset[,4]
+dataset[,1]<-dataset[,1]/12
+dataset[,2]<-dataset[,2]/12
+
+startingpara<-c(startingparafun(dataset),-1.1,0.69,0)
+pointest<-emfun(dataset, 100, paraest=startingpara, lg=lg, lg2=lg2)
+
+##parametric bootstrap
+replicatesnum<-500
+parabootmat<-matrix(data=NA, nrow=500, ncol=9)
+for(i in 1:replicatesnum){
+  print(i)
+  newdataset<-newdatagen1(a1=1.817479, a2=3.902200, b1=1.204794, b2=0.8839339,n=197, rho=0.2885303,
+                          phi00=0.2052658,phi01=0.4724022, phi10=9.216729e-05,crate=1.6, ftime=5 )
+  startingparaest<-c(startingparafun(newdataset),-1.1,0.69,0)
+  parabootmat[i,]<-emfun(dataset, it=500, startingparaest, lg=lg, lg2=lg2)
+}
+
+#For SE
+sqrt(var(parabootmat))
+
+##Acceleration parameter
+meann<-colMeans(parabootmat)
+amat<-c()
+for(i in 1:9){
+  lstest<-parabootmat[,i]
+  upp<-sum((lstest-meann[i])^3)
+  downn<-6*sum((parabootmat-meann[i])^2)^(3/2)
+  amat[i]<-upp/downn
+}
+
+##Bias corrected z
+zmat<-c()
+for(i in 1:9){
+  lstest<-parabootmat[,i]
+  inn<-sum(lstest<pointest[i])/replicatesnum
+  zmat[i]<-qnorm(inn)
+}
+
+zalpha<-qnorm(0.025)
+zalpha1<-qnorm(0.975)
+lb<-pnorm(zmat+(zmat+zalpha)/(1-amat*(zmat+zalpha)))
+ub<-pnorm(zmat+(zmat+zalpha1)/(1-amat*(zmat+zalpha1)))
+
+#The confidence intervals
+for(i in 1:9){
+  print(quantile(parabootmat[,i], c(lb[i],ub[i])))
+}
+
+```
+
+
+This code plots the fitted marginal Weibull distribution and the Kaplan Meier estimated curve to the retinopathy real data example
+```{r plot graph for retinopathy example}
+km1<-survfit(Surv(xobs, 1-cenx)~1, data= dataset)
+km2<-survfit(Surv(yobs, 1-ceny)~1, data= dataset)
+km_df_1<-data.frame(time_km=km1$time, median_km=km1$surv)
+km_df_2<-data.frame(time_km=km2$time, median_km=km2$surv)
+xlist<-seq(0,7,by=0.01)
+weibull1<-0.32*exp(-(xlist/1.82)^1.2)+0.68
+weibull2<-0.79*exp(-(xlist/3.9)^0.88)+0.21
+w_df_1<-data.frame(time=xlist, median=weibull1)
+w_df_2<-data.frame(time=xlist, median=weibull2)
+
+ret_graph <- ggplot() +
+  geom_line(data=w_df_1, aes(x=time, y=median, color="Treated eyes", linetype = "Marginal Weibull Distribution"), linewidth=1) +
+  geom_step(data=km_df_1, aes(x=time_km, y=median_km, color="Treated eyes", linetype="Kaplan Meier"), linewidth=1) +
+  geom_line(data=w_df_2, aes(x=time, y=median, color="Untreated eyes", linetype = "Marginal Weibull Distribution"), linewidth=1) +
+  geom_step(data=km_df_2, aes(x=time_km, y=median_km, color="Untreated eyes", linetype = "Kaplan Meier"), linewidth=1) +
+  theme_bw() +
+  labs(title = "Survival curves for Treated and Untreated Eyes",
+       x="Time (years)", y="Survival probability", 
+       color="Fit", fill="Fit", linetype="Fit") +
+  scale_x_continuous(breaks = seq(0, 6, 1), expand = c(0, 0), limits=c(0,6.25)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits=c(0,1), expand = c(0, 0)) +
+  theme(plot.title = element_text(hjust = 0.5, size=16),
+        legend.text = element_text(size = 12),
+        axis.text = element_text(size = 11))
+
+
+
+ret_graph
+```
+
